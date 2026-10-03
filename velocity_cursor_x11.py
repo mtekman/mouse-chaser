@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-velocity_cursor_x11.py
+velocity_cursor_x11_inertia.py
 
-A velocity-reactive custom mouse cursor for X11/Xorg:
+A velocity-reactive vector mouse cursor for X11/Xorg:
 - Hides the ordinary X cursor.
-- Draws a custom PyQt6 cursor overlay at the real mouse location.
+- Draws a vector spaceship cursor with PyQt6/QPainter.
+- The green dot is locked to the real pointer position.
+- The spaceship follows the green dot with inertia.
 - Cursor grows and stretches with velocity/acceleration.
-- Cursor leans toward its movement direction.
-- Overlay is transparent and click-through.
+- Cursor rotates toward its movement direction.
+- Both overlays are transparent and click-through.
+- No Pillow dependency.
 
 Install:
-    pip install --user PyQt6 python-xlib Pillow
+    pip install --user PyQt6 python-xlib
 
 Run:
-    python3 velocity_cursor_x11.py
+    python3 velocity_cursor_x11_inertia.py
 
 Stop:
     Ctrl+C
@@ -25,14 +28,16 @@ Important:
 from __future__ import annotations
 
 import math
+import os
 import signal
 import sys
 import time
 from dataclasses import dataclass
 
-from PIL import Image, ImageDraw
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QImage, QPainter
+from PyQt6.QtCore import QPointF, Qt, QTimer
+from PyQt6.QtCore import QRectF
+from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import QApplication, QWidget
 from Xlib import X, display
 from Xlib.ext import xfixes
@@ -40,22 +45,48 @@ from Xlib.ext import xfixes
 
 # ───────────────────────── Appearance / responsiveness ───────────────────────
 
-BASE_SIZE = 10          # Normal cursor size in pixels.
-MAX_SCALE = 5.00        # Maximum cursor growth at speed.
-MAX_STRETCH = 1      # Maximum elongation in movement direction.
-MAX_TILT_DEG = 160.0     # Maximum clockwise/counter-clockwise lean.
-POLL_MS = 15             # Update interval: 8 ms ≈ 125 FPS.
-SMOOTHING = 0.24        # 0.0 = smooth/heavy, 1.0 = immediate/jittery.
-ROTATE_OFFSET = 35     # Initial rotation offset (e.g. to point to the green dot)
+BASE_SIZE = 8              # Base vector cursor size in logical pixels.
+MAX_SCALE = 2.0             # Maximum growth at speed.
+MAX_STRETCH = 1.5           # 1.0 means no additional elongation.
+MAX_TILT_DEG = 160.0        # Maximum clockwise/counter-clockwise lean.
+POLL_MS = 15                # Update interval.
+SMOOTHING = 0.24            # Shape smoothing.
 
-# Velocity and acceleration sensitivity:
-# Lower values make the effect appear sooner.
-SPEED_FULL_SCALE = 800.0       # Pixels per second for maximum effect.
-ACCEL_FULL_SCALE = 90000.0      # Pixels per second squared for max pop.
-ACCEL_SCALE_BONUS = 0.20        # Extra size briefly added during a flick.
+# Spaceship inertia: spring-follows the real pointer.
+# Higher SPRING_STIFFNESS = snappier catch-up.
+# Higher SPRING_DAMPING = less overshoot / less wobble.
+SPRING_STIFFNESS =    90.0
+SPRING_DAMPING   =    18.0
+MAX_SHIP_SPEED   = 120.0    # Pixels per second safety limit.
+ANGULAR_STIFFNESS = 30.0
+ANGULAR_DAMPING = 7.0
+MAX_ANGULAR_VELOCITY_DEG = 420.0   # Degrees per second.
+ANGULAR_SETTLE_RATE = 10.0 
 
+# Lower values make the visual effects appear sooner.
+SPEED_FULL_SCALE  =   800.0     # Pixels per second for maximum effect.
+ACCEL_FULL_SCALE  = 90000.0     # Pixels per second squared for max pop.
+ACCEL_SCALE_BONUS =     0.20    # Extra size briefly added during a flick.
 
-# ─────────────────────────── Math / cursor state ─────────────────────────────
+ROTATE_OFFSET = 0        # Applied in all contexts
+REST_ROTATE_OFFSET = -50  # Applied additionally below the speed threshold
+SPEED_THRESHOLD = 5       # 
+
+# Overlay canvas must contain the largest rotated vector cursor.
+OVERLAY_SIZE = int(BASE_SIZE * MAX_SCALE * max(MAX_STRETCH, 1.0) * 6)
+
+# Green pointer marker size.
+GREEN_DOT_SIZE = 5
+
+ANGULAR_STIFFNESS = 14.0
+ANGULAR_DAMPING = 5.5
+MAX_ANGULAR_VELOCITY_DEG = 320.0
+ANGULAR_SETTLE_RATE = 3.0
+
+with open("spaceship.svg", "br") as f:
+    SPACESHIP_SVG = f.read()
+
+# ─────────────────────────── Cursor state / physics ──────────────────────────
 
 @dataclass
 class CursorShape:
@@ -81,218 +112,156 @@ def lerp_angle(current: float, target: float, amount: float) -> float:
 
 
 class CursorPhysics:
-    """Converts pointer position samples into visual cursor shape values."""
+    """
+    Converts pointer samples into a momentum-driven spaceship state.
+
+    The spaceship has:
+    - Linear momentum: position and velocity follow the pointer via a spring.
+    - Angular momentum: heading changes through steering torque, rather than
+      immediately matching the movement direction.
+    """
 
     def __init__(self) -> None:
-        self.last_x: int | None = None
-        self.last_y: int | None = None
+        self.pointer_x: int | None = None
+        self.pointer_y: int | None = None
         self.last_time: float | None = None
+
+        # Linear state.
+        self.ship_x = 0.0
+        self.ship_y = 0.0
+        self.ship_vx = 0.0
+        self.ship_vy = 0.0
+
+        # Angular state.
+        # The unrotated SVG spaceship points upward, which is -90 degrees in
+        # standard screen/movement coordinates.
+        self.heading_deg = -90.0
+        self.angular_velocity_deg = 0.0
+
         self.last_speed = 0.0
         self.shape = CursorShape()
 
-    def update(self, x: int, y: int) -> CursorShape:
+    def update(self, pointer_x: int, pointer_y: int) -> CursorShape:
         now = time.monotonic()
 
-        # First sample establishes initial state only.
         if self.last_time is None:
-            self.last_x = x
-            self.last_y = y
+            self.pointer_x = pointer_x
+            self.pointer_y = pointer_y
             self.last_time = now
+
+            self.ship_x = float(pointer_x)
+            self.ship_y = float(pointer_y)
+
             return self.shape
 
         dt = max(now - self.last_time, 0.001)
-        dx = x - self.last_x
-        dy = y - self.last_y
-
-        self.last_x = x
-        self.last_y = y
         self.last_time = now
 
-        speed = math.hypot(dx, dy) / dt
-        acceleration = max(0.0, (speed - self.last_speed) / dt)
-        self.last_speed = speed
+        self.pointer_x = pointer_x
+        self.pointer_y = pointer_y
 
-        speed_amount = clamp(speed / SPEED_FULL_SCALE, 0.0, 1.0)
+        # ── Linear spring physics ────────────────────────────────────────
+        dx = pointer_x - self.ship_x
+        dy = pointer_y - self.ship_y
+
+        ax = SPRING_STIFFNESS * dx - SPRING_DAMPING * self.ship_vx
+        ay = SPRING_STIFFNESS * dy - SPRING_DAMPING * self.ship_vy
+
+        self.ship_vx += ax * dt
+        self.ship_vy += ay * dt
+
+        ship_speed = math.hypot(self.ship_vx, self.ship_vy)
+
+        if ship_speed > MAX_SHIP_SPEED:
+            factor = MAX_SHIP_SPEED / ship_speed
+            self.ship_vx *= factor
+            self.ship_vy *= factor
+            ship_speed = MAX_SHIP_SPEED
+
+        self.ship_x += self.ship_vx * dt
+        self.ship_y += self.ship_vy * dt
+
+        acceleration = max(0.0, (ship_speed - self.last_speed) / dt)
+        self.last_speed = ship_speed
+
+        # ── Visual scale and stretch ─────────────────────────────────────
+        speed_amount = clamp(ship_speed / SPEED_FULL_SCALE, 0.0, 1.0)
         accel_amount = clamp(acceleration / ACCEL_FULL_SCALE, 0.0, 1.0)
 
-        # Larger on speed; a rapid acceleration produces a brief "pop".
         target_scale = 1.0 + speed_amount * (MAX_SCALE - 1.0)
         target_scale += accel_amount * ACCEL_SCALE_BONUS
         target_scale = clamp(target_scale, 1.0, MAX_SCALE)
 
-        # Stretch in the direction the cursor is traveling.
         target_stretch = 1.0 + speed_amount * (MAX_STRETCH - 1.0)
 
-        # Keep arrow recognisable: lean it toward motion, rather than
-        # continually spinning the arrow through all 360 degrees.
-        if speed > 15.0:
-            # Movement direction in degrees:
-            # 0 = right, 90 = down, 180/-180 = left, -90 = up
-            direction = math.degrees(math.atan2(dy, dx))
-
-            # Our arrow points up when angle_deg = 0.
-            # To make the nose point along the movement direction,
-            # we need to rotate the arrow so that "up" aligns with `direction`.
-            # "Up" in movement-direction terms is -90°.
-            # So the required rotation is:
-            #   target_angle = direction - (-90°) = direction + 90°
-            raw_angle = direction + 90.0
-
-            # Normalize to (-180, 180]
-            raw_angle = (raw_angle + 180.0) % 360.0 - 180.0
-
-            # Optionally limit how far it can tilt away from straight-ahead.
-            # If you want the nose to *always* point exactly along the movement,
-            # skip the clamp and just use: target_angle = raw_angle
-            target_angle = clamp(raw_angle, -MAX_TILT_DEG, MAX_TILT_DEG) + ROTATE_OFFSET
-
-        else:
-            target_angle = 0.0
-            
         self.shape.scale = lerp(self.shape.scale, target_scale, SMOOTHING)
         self.shape.stretch = lerp(
             self.shape.stretch,
             target_stretch,
             SMOOTHING,
         )
+
+        # ── Angular momentum / steering ──────────────────────────────────
+        if ship_speed > SPEED_THRESHOLD:
+            # Desired nose direction, based on the ship's actual velocity.
+            movement_direction = math.degrees(
+                math.atan2(self.ship_vy, self.ship_vx)
+            )
+
+            # The SVG nose points upward, i.e. -90 degrees.
+            desired_heading = movement_direction + 90.0
+
+            # Shortest signed angular error, in (-180, 180].
+            heading_error = (
+                desired_heading - self.heading_deg + 180.0
+            ) % 360.0 - 180.0
+
+            # Steering torque pulls angular velocity toward the desired
+            # heading. Angular damping prevents endless spinning.
+            angular_acceleration = (
+                ANGULAR_STIFFNESS * heading_error
+                - ANGULAR_DAMPING * self.angular_velocity_deg
+            )
+
+            self.angular_velocity_deg += angular_acceleration * dt
+
+            # Limit turn rate so a sudden reversal cannot produce an
+            # instantaneous 180-degree flip.
+            self.angular_velocity_deg = clamp(
+                self.angular_velocity_deg,
+                -MAX_ANGULAR_VELOCITY_DEG,
+                MAX_ANGULAR_VELOCITY_DEG,
+            )
+        else:
+            # When nearly stopped, gently settle the heading and rotation.
+            self.angular_velocity_deg *= math.exp(-ANGULAR_SETTLE_RATE * dt)
+
+        # Integrate heading.
+        self.heading_deg += self.angular_velocity_deg * dt
+        self.heading_deg %= 360.0
+
+        # Convert ship heading to the overlay's Qt rotation.
+        #
+        # The SVG's unrotated nose is upward. Qt rotation is clockwise.
+        # We preserve the physical heading while applying the user's optional
+        # visual offset.
+        target_qt_angle = self.heading_deg + ROTATE_OFFSET
+
         self.shape.angle_deg = lerp_angle(
             self.shape.angle_deg,
-            target_angle,
+            target_qt_angle,
             SMOOTHING,
         )
-        self.shape.speed = speed
+
+        self.shape.speed = ship_speed
         self.shape.acceleration = acceleration
 
         return self.shape
 
-
-# ────────────────────────── Cursor image generation ──────────────────────────
-
-def make_dot(logical_size: int) -> Image.Image:
-    """
-    Create a small square with a 1×1 opaque green dot in the center.
-    """
-    size = max(3, logical_size)
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-
-    cx = size // 2
-    cy = size // 2
-    # Green dot at the actual pointer position
-    draw.point((cx, cy), fill=(0, 255, 0, 255))
-
-    return image
-
-def make_arrow(logical_size: int) -> Image.Image:
-    """
-    Draw a vector-outline triangular spaceship inspired by Asteroids.
-
-    Returns a transparent RGBA Pillow image. The ship points upward,
-    so the cursor physics can rotate it toward movement.
-    """
-    # Oversized canvas prevents the outline from clipping during rotation.
-    canvas = logical_size * 2
-    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-
-    X = 20
-    
-    s = logical_size
-    cx = canvas / 2
-    cy = canvas / 2
-
-    # Main triangular hull.
-    # The nose points upward; the rear is open like the arcade ship.
-    nose = (cx, cy - s * 1.15)
-    left_rear = (cx - s * 0.95, cy + s * 0.90)
-    right_rear = (cx + s * 0.95, cy + s * 0.90)
-
-    # Small rear notch, suggesting the engine cutout.
-    rear_center_top = (cx, cy + s * 0.35)
-    rear_center_bottom = (cx, cy + s * 0.35)
-
-    hull = [
-        nose,
-        right_rear,
-        rear_center_bottom,
-        rear_center_top,
-        left_rear,
-        nose,
-    ]
-
-    # Bright vector-style outline.
-    line_width = max(2, round(logical_size * 0.10))
-    draw.line(
-        hull,
-        fill=(255, 255, 255, 255),
-        width=line_width,
-        joint="curve",
-    )
-
-    # Optional cockpit line: a short internal stroke near the nose.
-    cockpit_top = (cx, cy - s * 0.45)
-    cockpit_bottom = (cx, cy + s * 0.10)
-    draw.line(
-        [cockpit_top, cockpit_bottom],
-        fill=(255, 255, 255, 200),
-        width=max(1, round(line_width * 0.55)),
-    )
-
-    return image
-
-
-def transform_cursor(shape: CursorShape) -> Image.Image:
-    """Apply size, stretch, and angle to the base arrow, then add a green dot at the tip."""
-    logical_size = max(12, round(BASE_SIZE * shape.scale))
-    arrow = make_arrow(logical_size)
-
-    # Stretch in the direction of travel (horizontal in image space before rotation).
-    stretched_width = max(1, round(arrow.width * shape.stretch))
-    stretched_height = max(1, round(arrow.height * shape.stretch))
-    arrow = arrow.resize(
-        (stretched_width, stretched_height),
-        Image.Resampling.LANCZOS,
-    )
-
-    # Rotate so the nose points along the movement direction.
-    # Pillow rotates counterclockwise for positive angles.
-    # Our angle_deg is defined such that positive = clockwise lean.
-    arrow = arrow.rotate(
-        -shape.angle_deg + ROTATE_OFFSET,
-        resample=Image.Resampling.BICUBIC,
-        expand=True,
-    )
-
-    # Compute hotspot in the same way as in tick().
-    # This is where the tip / green dot will be.
-    hotspot_x = round(BASE_SIZE * shape.scale * 0.35)
-    hotspot_y = round(BASE_SIZE * shape.scale * 0.15)
-
-    # Create a small green dot image.
-    dot = make_dot(logical_size)  # 1×1 green pixel in a small canvas
-
-    # Ensure the arrow canvas is large enough to place the dot.
-    # We want the dot's center at (hotspot_x, hotspot_y) in the final image.
-    dx = hotspot_x - dot.width // 2
-    dy = hotspot_y - dot.height // 2
-
-    min_width = dx + dot.width
-    min_height = dy + dot.height
-    if arrow.width < min_width or arrow.height < min_height:
-        new_width = max(arrow.width, min_width)
-        new_height = max(arrow.height, min_height)
-        expanded = Image.new("RGBA", (new_width, new_height), (0, 0, 0, 0))
-        expanded.paste(arrow, (0, 0))
-        arrow = expanded
-
-    # Paste the green dot so its center is exactly at the tip/hotspot.
-    arrow.paste(dot, (dx, dy), dot)
-    return arrow
-
-# ───────────────────────────── PyQt overlay ──────────────────────────────────
+# ───────────────────────────── PyQt vector overlays ──────────────────────────
 
 class CursorOverlay(QWidget):
-    """An always-on-top, transparent, non-interactive cursor window."""
+    """An always-on-top, transparent, click-through vector spaceship window."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -305,41 +274,111 @@ class CursorOverlay(QWidget):
             | Qt.WindowType.WindowTransparentForInput
         )
 
-        # The Qt window uses per-pixel alpha. Unpainted pixels show the
-        # desktop beneath rather than an opaque rectangular background.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-
-        # Defensive extra setting for Qt/widget-level event delivery.
         self.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents,
             True,
         )
 
-        self._qimage: QImage | None = None
+        self.setFixedSize(OVERLAY_SIZE, OVERLAY_SIZE)
 
-    def set_image(self, pil_image: Image.Image) -> None:
-        """Convert Pillow RGBA data to an owned QImage."""
-        rgba = pil_image.convert("RGBA")
-        raw = rgba.tobytes("raw", "RGBA")
+        self.shape = CursorShape()
+        self.svg_renderer = self._make_svg_renderer()
 
-        # .copy() is crucial: it gives Qt memory ownership independent
-        # of Pillow's temporary raw buffer.
-        self._qimage = QImage(
-            raw,
-            rgba.width,
-            rgba.height,
-            QImage.Format.Format_RGBA8888,
-        ).copy()
+    def _make_svg_renderer(self) -> QSvgRenderer:
+        """
+        Create a renderer for the generic SVG/XML spaceship declaration.
+    
+        QSvgRenderer parses SVG XML and renders it through QPainter, preserving
+        vector quality while the cursor is scaled, stretched, and rotated.
+        """
+        renderer = QSvgRenderer()
+        renderer.load(SPACESHIP_SVG)
+    
+        if not renderer.isValid():
+            raise RuntimeError("The embedded spaceship SVG could not be parsed.")
+    
+        return renderer
 
-        self.resize(rgba.width, rgba.height)
+    def set_shape(self, shape: CursorShape) -> None:
+        """Set the latest physics state and request a repaint."""
+        self.shape = shape
         self.update()
 
     def paintEvent(self, event) -> None:
-        if self._qimage is None:
-            return
-
         painter = QPainter(self)
-        painter.drawImage(0, 0, self._qimage)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # The overlay is positioned so that its center is the simulated
+        # spaceship location. The ship's local origin is therefore centered.
+        center_x = OVERLAY_SIZE / 2.0
+        center_y = OVERLAY_SIZE / 2.0
+
+        painter.save()
+
+        painter.translate(center_x, center_y)
+
+        # Positive Qt rotation is clockwise in widget/screen coordinates.
+        painter.rotate(self.shape.angle_deg)
+
+        # Scale width uniformly, then elongate along the ship's forward axis.
+        painter.scale(
+            self.shape.scale,
+            self.shape.scale * self.shape.stretch,
+        )
+
+        self._draw_ship(painter)
+
+        painter.restore()
+        painter.end()
+
+    def _draw_ship(self, painter: QPainter) -> None:
+        """
+        Render the generic SVG spaceship through the current painter transform.
+    
+        The painter has already been translated to the simulated ship position,
+        rotated toward its velocity, and scaled/stretched.
+        """
+        # SVG bounds from the declaration:
+        # viewBox="-10 -2 20 24"
+        svg_bounds = QRectF(-10.0, -2.0, 20.0, 24.0)
+    
+        # Render at the SVG's natural logical size. The active painter transform
+        # scales and rotates it without rasterizing it in advance.
+        self.svg_renderer.render(painter, svg_bounds)
+        
+
+class GreenDotOverlay(QWidget):
+    """A tiny always-on-top overlay that marks the real pointer position."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.BypassWindowManagerHint
+            | Qt.WindowType.WindowTransparentForInput
+        )
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+
+        self.setFixedSize(GREEN_DOT_SIZE, GREEN_DOT_SIZE)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # Bright green filled circle centered on the real pointer.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 255, 0, 255))
+        painter.drawEllipse(2, 2, 5, 5)
+
         painter.end()
 
 
@@ -350,31 +389,26 @@ class VelocityCursorX11:
         self.running = True
         self.physics = CursorPhysics()
 
-        # Connect to the active X server via DISPLAY.
         self.dpy = display.Display()
         self.root = self.dpy.screen().root
 
-        # Install a blank cursor on the root window; the Qt overlay becomes
-        # the visible pointer.
-        # Ask the X server whether XFIXES is available.
         xfixes_version = self.dpy.xfixes_query_version()
         if xfixes_version.major_version < 2:
             raise RuntimeError("XFIXES >= 2.0 is required to hide the cursor.")
 
-        # Hide the actual X cursor for this client, including over
-        # applications whose windows would otherwise show their own cursor.
         self.root.xfixes_hide_cursor()
 
-        # Also set a blank root cursor as a fallback for clients/windows
-        # that inherit root cursor attributes.
         self.blank_cursor = self._create_transparent_xcursor()
         self.root.change_attributes(cursor=self.blank_cursor)
-
         self.dpy.sync()
-        
+
         self.qt_app = QApplication(sys.argv)
+
         self.overlay = CursorOverlay()
         self.overlay.show()
+
+        self.green_dot = GreenDotOverlay()
+        self.green_dot.show()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
@@ -382,11 +416,12 @@ class VelocityCursorX11:
 
     def _create_transparent_xcursor(self):
         """
-        Make an invisible X cursor from two 1-bit pixmaps.
+        Create an invisible X cursor from two one-bit pixmaps.
 
-        Python-Xlib's signature is:
-            source.create_cursor(mask, foreground_rgb, background_rgb,
-                                 hotspot_x, hotspot_y)
+        Python-Xlib signature:
+            source.create_cursor(
+                mask, foreground_rgb, background_rgb, hotspot_x, hotspot_y
+            )
         """
         source = self.root.create_pixmap(1, 1, 1)
         mask = self.root.create_pixmap(1, 1, 1)
@@ -394,14 +429,14 @@ class VelocityCursorX11:
         source_gc = source.create_gc(foreground=0, background=0)
         mask_gc = mask.create_gc(foreground=0, background=0)
 
-        # A zero mask means no visible cursor pixels.
+        # Zero mask bits make the cursor fully transparent.
         source.poly_fill_rectangle(source_gc, [(0, 0, 1, 1)])
         mask.poly_fill_rectangle(mask_gc, [(0, 0, 1, 1)])
 
         cursor = source.create_cursor(
             mask,
-            (0, 0, 0),  # foreground RGB, irrelevant with an empty mask
-            (0, 0, 0),  # background RGB, irrelevant with an empty mask
+            (0, 0, 0),
+            (0, 0, 0),
             0,
             0,
         )
@@ -419,23 +454,35 @@ class VelocityCursorX11:
         return reply.root_x, reply.root_y
 
     def tick(self) -> None:
-        """Read pointer motion and redraw/reposition the custom cursor."""
+        """
+        Read the real pointer, advance the spaceship simulation, then position
+        the vector ship while keeping the green dot on the real pointer.
+        """
         if not self.running:
             return
 
         try:
-            x, y = self.pointer_position()
-            shape = self.physics.update(x, y)
-            image = transform_cursor(shape)
+            pointer_x, pointer_y = self.pointer_position()
+            shape = self.physics.update(pointer_x, pointer_y)
 
-            self.overlay.set_image(image)
+            # Move the ship overlay to its simulated position. Its center is
+            # the ship's local origin/nose.
+            ship_x = round(self.physics.ship_x)
+            ship_y = round(self.physics.ship_y)
 
-            # The drawn arrow's nominal tip is near the image's upper-left
-            # interior; preserve it around the true pointer position.
-            hotspot_x = round(BASE_SIZE * shape.scale * 0.35)
-            hotspot_y = round(BASE_SIZE * shape.scale * 0.15)
+            self.overlay.move(
+                ship_x - OVERLAY_SIZE // 2,
+                ship_y - OVERLAY_SIZE // 2,
+            )
 
-            self.overlay.move(x - hotspot_x, y - hotspot_y)
+            # Repaint the vector spaceship with the latest shape.
+            self.overlay.set_shape(shape)
+
+            # Center the green dot overlay on the actual pointer coordinate.
+            self.green_dot.move(
+                pointer_x - GREEN_DOT_SIZE // 2,
+                pointer_y - GREEN_DOT_SIZE // 2,
+            )
 
         except Exception as error:
             print(f"Cursor update failed: {error}", file=sys.stderr)
@@ -443,7 +490,7 @@ class VelocityCursorX11:
             self.qt_app.quit()
 
     def stop(self, *_args) -> None:
-        """Restore the normal X cursor and close resources."""
+        """Restore the normal X cursor and release resources."""
         if not self.running:
             return
 
@@ -455,12 +502,17 @@ class VelocityCursorX11:
             pass
 
         try:
+            self.green_dot.close()
+        except Exception:
+            pass
+
+        try:
             self.overlay.close()
         except Exception:
             pass
 
         try:
-            # X.NONE restores regular cursor inheritance.
+            # Restore ordinary cursor inheritance.
             self.root.change_attributes(cursor=X.NONE)
             self.dpy.sync()
         except Exception:
@@ -480,8 +532,7 @@ class VelocityCursorX11:
 # ───────────────────────────────── Entrypoint ────────────────────────────────
 
 def main() -> None:
-    # Fail early with a clearer message if DISPLAY is unavailable.
-    if not __import__("os").environ.get("DISPLAY"):
+    if not os.environ.get("DISPLAY"):
         raise SystemExit(
             "No X11 DISPLAY detected. Run this from an X11/Xorg desktop session."
         )
