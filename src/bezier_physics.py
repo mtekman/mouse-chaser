@@ -5,7 +5,7 @@ from spaceship import SpacecraftState, clamp, lerp, lerp_angle
 from config import load_config
 from pathlib import Path
 
-CONFIG_PATH = Path("..").with_name("config.toml")
+CONFIG_PATH = Path("..").with_name("config.yaml")
 CONFIG, SPACESHIP_SVG = load_config(CONFIG_PATH)
 
 BezierSegment = tuple[

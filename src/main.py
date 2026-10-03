@@ -38,7 +38,7 @@ from cursor_x11 import CursorX11
 from config import load_config
 from pathlib import Path
 
-CONFIG, SPACESHIP_SVG = load_config(Path("config.toml"))
+CONFIG, SPACESHIP_SVG = load_config(Path("config.yaml"))
 
 def main() -> None:
     if not environ.get("DISPLAY"):
