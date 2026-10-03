@@ -1,107 +1,12 @@
-#!/usr/bin/env python3
-"""
-velocity_cursor_x11_bezier.py
-
-A velocity-reactive vector mouse cursor for X11/Xorg.
-
-Features:
-- Hides the ordinary X cursor.
-- Draws an SVG spaceship with PyQt6/QSvgRenderer.
-- The green dot is locked to the real pointer position.
-- The spaceship follows a smooth multi-segment cubic Bezier route.
-- The ship preserves momentum between route replans.
-- The ship's heading always follows the active Bezier tangent.
-- Optional debugging overlay displays the Bezier route.
-- Transparent, click-through overlays.
-- No Pillow dependency.
-
-Install:
-    pip install --user PyQt6 python-xlib
-
-Run:
-    python3 velocity_cursor_x11_bezier.py
-
-Stop:
-    Ctrl+C
-
-Important:
-    Requires an X11/Xorg session, not Wayland.
-"""
-
-from __future__ import annotations
-
 import math
-import os
-import signal
-import sys
-import time
-from dataclasses import dataclass
+from time import monotonic
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PyQt6.QtSvg import QSvgRenderer
-from PyQt6.QtWidgets import QApplication, QWidget
-from Xlib import X, display
-from Xlib.ext import xfixes
+from spaceship import SpacecraftState, clamp, lerp, lerp_angle
+from config import load_config
+from pathlib import Path
 
-
-# ───────────────────────── Appearance / responsiveness ───────────────────────
-
-# Visual response.
-VIZ_SIZE_BASE = 10
-VIZ_ANGLE_OFFSET = 0
-VIZ_SPEED_MULT = 1e-3
-VIZ_ACCEL_MULT = 1e-4
-VIZ_SCALE_MAX = 1.5
-VIZ_ELONG_MAX = 1.5
-VIZ_SHAPE_SMOOTH = 0.4
-
-# Linear motion.
-LIN_SPEED_MAX = 700
-LIN_SPEED_MIN = 500
-LIN_SPEED_DRAG = 1.2
-
-# Multi-segment Bezier route.
-DEBUG_DRAW_BEZIER = False
-BEZIER_REPLAN_DISTANCE = 100.0          ## How far to move before recalculating a curve
-BEZIER_WAYPOINT_CURVE_FRACTION = 0.1    ## 0 less curvy, high is more S-curvy. 1 is crazy. 0.1 feels good
-BEZIER_START_HANDLE_FRACTION = 10       ## High = more drift with broader turns. 10 gives nice looser feel
-BEZIER_START_HANDLE_MAX = 180.0         ## Stops fast movement from creating massive cruve. 180 is a good value.
-BEZIER_END_HANDLE_FRACTION = 0.8        ## How strong current momentum carries into new route. Higher = more drift
-BEZIER_END_HANDLE_MAX = 300             ## Max runway to ease into target. Low = tighter, high = broader, graceful
-BEZIER_MIN_SPEED = LIN_SPEED_MAX        ## Min speed to maintain along route
-BEZIER_ACCELERATION = 100               ## Rate at which to meet LIN_SPEED_MAX
-BEZIER_LENGTH_SAMPLES = 10              ## Number of samples to estimate Bezier
-## BEZIER_SEGMENT_COUNT = 1             ## This is dynamically calcualted.
-
-# Dead zone around the green dot.
-PHYS_DEAD_ZONE = 100  ## Do nothing until dot moves away
-
-# Force a route recalculation after the pointer is roughly stationary
-# for this many consecutive update ticks.
-POLL_MS = 8
-STATIONARY_TICKS_REQUIRED = 10
-STATIONARY_RADIUS = 10
-STATIONARY_RESET_RADIUS = 20
-
-# Fade the spaceship out as its distance from the green dot increases.
-SPACESHIP_FADE_START_DISTANCE = 1.0   # Fully opaque at or below this.
-SPACESHIP_FADE_END_DISTANCE = 80.0     # Fully transparent at or above this.
-SPACESHIP_MIN_OPACITY = 0             # Set to 0.15 to keep a faint ship.
-
-# While the left mouse button is held, recalculate the Bezier route
-# every this many update ticks.
-MOUSE_DOWN_RECALC_INTERVAL = 5 ## This helps it orbit
-
-# Overlay sizing.
-OVERLAY_SIZE = int(VIZ_SIZE_BASE * VIZ_SCALE_MAX * max(VIZ_ELONG_MAX, 1.0) * 6)
-GREEN_DOT_SIZE = 12
-
-with open("spaceship.svg", "br") as f:
-    SPACESHIP_SVG = f.read()
-
-screen_dist = math.hypot(2560, 1440)
-# ─────────────────────────────── Math helpers ────────────────────────────────
+CONFIG_PATH = Path("..").with_name("config.toml")
+CONFIG, SPACESHIP_SVG = load_config(CONFIG_PATH)
 
 BezierSegment = tuple[
     tuple[float, float],
@@ -110,33 +15,9 @@ BezierSegment = tuple[
     tuple[float, float],
 ]
 
+screen_dist = math.hypot(2560, 1440)
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def lerp(current: float, target: float, amount: float) -> float:
-    return current + (target - current) * amount
-
-
-def lerp_angle(current: float, target: float, amount: float) -> float:
-    """Interpolate through the shortest circular route."""
-    delta = (target - current + 180.0) % 360.0 - 180.0
-    return (current + delta * amount) % 360.0
-
-
-@dataclass
-class CursorShape:
-    scale: float = 1.0
-    angle_deg: float = 0.0
-    stretch: float = 1.0
-    speed: float = 0.0
-    acceleration: float = 0.0
-    distance_opacity: float = 1.0
-
-# ─────────────────────────── Bezier flight physics ───────────────────────────
-
-class CursorPhysics:
+class BezierPhysics:
     """
     Moves a spaceship along a smooth multi-segment cubic Bezier route.
 
@@ -169,7 +50,7 @@ class CursorPhysics:
         self.traveled_distance = 0.0
 
         self.last_speed = 0.0
-        self.shape = CursorShape()
+        self.shape = SpacecraftState()
 
         # Stationary-pointer detection.
         self.stationary_tick_count = 0
@@ -196,25 +77,25 @@ class CursorPhysics:
             pointer_y - self.ship_y,
         )
 
-        if distance <= SPACESHIP_FADE_START_DISTANCE:
-            return SPACESHIP_MIN_OPACITY
+        if distance <= CONFIG["SPACESHIP_FADE_START_DISTANCE"]:
+            return CONFIG["SPACESHIP_MIN_OPACITY"]
 
-        if distance >= SPACESHIP_FADE_END_DISTANCE:
+        if distance >= CONFIG["SPACESHIP_FADE_END_DISTANCE"]:
             return 1.0
 
         fade_range = (
-            SPACESHIP_FADE_END_DISTANCE
-            - SPACESHIP_FADE_START_DISTANCE
+            CONFIG["SPACESHIP_FADE_END_DISTANCE"]
+            - CONFIG["SPACESHIP_FADE_START_DISTANCE"]
         )
 
         fade_progress = (
-            distance - SPACESHIP_FADE_START_DISTANCE
+            distance - CONFIG["SPACESHIP_FADE_START_DISTANCE"]
         ) / fade_range
 
         # Interpolate from the minimum opacity at close range to full
         # opacity at long range.
         return lerp(
-            SPACESHIP_MIN_OPACITY,
+            CONFIG["SPACESHIP_MIN_OPACITY"],
             1.0,
             fade_progress,
         )
@@ -245,7 +126,7 @@ class CursorPhysics:
         )
 
         # Pointer has moved materially since the last stationary reference.
-        if movement_from_reference > STATIONARY_RESET_RADIUS:
+        if movement_from_reference > CONFIG["STATIONARY_RESET_RADIUS"]:
             self.last_stationary_x = pointer_x
             self.last_stationary_y = pointer_y
             self.stationary_tick_count = 1
@@ -256,7 +137,7 @@ class CursorPhysics:
         self.stationary_tick_count += 1
 
         if (
-            self.stationary_tick_count >= STATIONARY_TICKS_REQUIRED
+            self.stationary_tick_count >= CONFIG["STATIONARY_TICKS_REQUIRED"]
             and not self.stationary_recalculated
         ):
             # Latch: prevent repeated recalculations while still stationary.
@@ -272,8 +153,8 @@ class CursorPhysics:
         pointer_y: int,
         *,
         mouse_down: bool = False,
-    ) -> CursorShape:
-        now = time.monotonic()
+    ) -> SpacecraftState:
+        now = monotonic()
 
         if self.last_time is None:
             self._initialize_state(pointer_x, pointer_y, now)
@@ -291,7 +172,7 @@ class CursorPhysics:
 
             if (
                 self.mouse_down_tick_count
-                >= MOUSE_DOWN_RECALC_INTERVAL
+                >= CONFIG["MOUSE_DOWN_RECALC_INTERVAL"]
             ):
                 self._create_route(
                     self.ship_x,
@@ -392,7 +273,7 @@ class CursorPhysics:
             target_y - old_target[1],
         )
 
-        if target_movement > BEZIER_REPLAN_DISTANCE:
+        if target_movement > CONFIG["BEZIER_REPLAN_DISTANCE"]:
             self._create_route(
                 self.ship_x,
                 self.ship_y,
@@ -422,7 +303,7 @@ class CursorPhysics:
         self.segment_lengths.clear()
         self.traveled_distance = 0.0
 
-        if distance < PHYS_DEAD_ZONE:
+        if distance < CONFIG["PHYS_DEAD_ZONE"]:
             # Create an exact straight-line cubic Bezier from the ship to
             # the target.
             #
@@ -520,7 +401,7 @@ class CursorPhysics:
 
                 curve_amount = (
                     distance
-                    * BEZIER_WAYPOINT_CURVE_FRACTION
+                    * CONFIG["BEZIER_WAYPOINT_CURVE_FRACTION"]
                     * side
                 )
 
@@ -572,8 +453,8 @@ class CursorPhysics:
                         p3[0] - p0[0],
                         p3[1] - p0[1],
                     )
-                    * BEZIER_START_HANDLE_FRACTION,
-                    BEZIER_START_HANDLE_MAX,
+                    * CONFIG["BEZIER_START_HANDLE_FRACTION"],
+                    CONFIG["BEZIER_START_HANDLE_MAX"],
                 )
 
                 tangent0_x = momentum_x * momentum_handle
@@ -651,8 +532,8 @@ class CursorPhysics:
         length = 0.0
         previous_x, previous_y = self._bezier_point(segment, 0.0)
 
-        for i in range(1, BEZIER_LENGTH_SAMPLES + 1):
-            t = i / BEZIER_LENGTH_SAMPLES
+        for i in range(1, CONFIG["BEZIER_LENGTH_SAMPLES"] + 1):
+            t = i / CONFIG["BEZIER_LENGTH_SAMPLES"]
             x, y = self._bezier_point(segment, t)
 
             length += math.hypot(
@@ -711,7 +592,7 @@ class CursorPhysics:
             0.0,
             self.total_length - self.traveled_distance,
         )
-        target_speed = max(remaining_distance, LIN_SPEED_MIN)
+        target_speed = max(remaining_distance, CONFIG["LIN_SPEED_MIN"])
 
 
         travel_distance = target_speed * dt
@@ -758,18 +639,18 @@ class CursorPhysics:
         dt: float,
     ) -> float:
         """Apply gentle drag and enforce the maximum speed."""
-        drag_factor = math.exp(-LIN_SPEED_DRAG * dt)
+        drag_factor = math.exp(-CONFIG["LIN_SPEED_DRAG"] * dt)
 
         self.ship_vx *= drag_factor
         self.ship_vy *= drag_factor
 
         ship_speed = math.hypot(self.ship_vx, self.ship_vy)
 
-        if ship_speed > LIN_SPEED_MAX:
-            factor = LIN_SPEED_MAX / ship_speed
+        if ship_speed > CONFIG["LIN_SPEED_MAX"]:
+            factor = CONFIG["LIN_SPEED_MAX"] / ship_speed
             self.ship_vx *= factor
             self.ship_vy *= factor
-            ship_speed = LIN_SPEED_MAX
+            ship_speed = CONFIG["LIN_SPEED_MAX"]
 
         acceleration = max(
             0.0,
@@ -787,32 +668,32 @@ class CursorPhysics:
     def _update_visuals(self, ship_speed: float, dt: float) -> None:
         acceleration = getattr(self, "_last_acceleration", 0.0)
 
-        speed_amount = clamp(ship_speed * VIZ_SPEED_MULT, 0.0, 1.0)
-        accel_amount = clamp(acceleration * VIZ_ACCEL_MULT, 0.0, 1.0)
+        speed_amount = clamp(ship_speed * CONFIG["VIZ_SPEED_MULT"], 0.0, 1.0)
+        accel_amount = clamp(acceleration * CONFIG["VIZ_ACCEL_MULT"], 0.0, 1.0)
 
-        target_scale = 1.0 + speed_amount * (VIZ_SCALE_MAX - 1.0)
-        target_scale += accel_amount * VIZ_ACCEL_MULT
-        target_scale = clamp(target_scale, 1.0, VIZ_SCALE_MAX)
+        target_scale = 1.0 + speed_amount * (CONFIG["VIZ_SCALE_MAX"] - 1.0)
+        target_scale += accel_amount * CONFIG["VIZ_ACCEL_MULT"]
+        target_scale = clamp(target_scale, 1.0, CONFIG["VIZ_SCALE_MAX"])
 
-        target_stretch = 1.0 + speed_amount * (VIZ_ELONG_MAX - 1.0)
+        target_stretch = 1.0 + speed_amount * (CONFIG["VIZ_ELONG_MAX"] - 1.0)
 
         self.shape.scale = lerp(
             self.shape.scale,
             target_scale,
-            VIZ_SHAPE_SMOOTH,
+            CONFIG["VIZ_SHAPE_SMOOTH"],
         )
         self.shape.stretch = lerp(
             self.shape.stretch,
             target_stretch,
-            VIZ_SHAPE_SMOOTH,
+            CONFIG["VIZ_SHAPE_SMOOTH"],
         )
 
-        target_qt_angle = self.heading_deg + VIZ_ANGLE_OFFSET
+        target_qt_angle = self.heading_deg + CONFIG["VIZ_ANGLE_OFFSET"]
 
         self.shape.angle_deg = lerp_angle(
             self.shape.angle_deg,
             target_qt_angle,
-            VIZ_SHAPE_SMOOTH,
+            CONFIG["VIZ_SHAPE_SMOOTH"],
         )
 
         self.shape.speed = ship_speed
@@ -828,434 +709,3 @@ class CursorPhysics:
         """Return the ship's current position."""
         return self.ship_x, self.ship_y
 
-
-# ───────────────────────────── PyQt vector overlays ──────────────────────────
-
-class CursorOverlay(QWidget):
-    """Transparent, click-through, always-on-top SVG spaceship overlay."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.BypassWindowManagerHint
-            | Qt.WindowType.WindowTransparentForInput
-        )
-
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
-            True,
-        )
-
-        self.setFixedSize(OVERLAY_SIZE, OVERLAY_SIZE)
-
-        self.shape = CursorShape()
-
-        self.svg_renderer = QSvgRenderer()
-        self.svg_renderer.load(SPACESHIP_SVG)
-
-        if not self.svg_renderer.isValid():
-            raise RuntimeError("The embedded spaceship SVG could not be parsed.")
-
-    def set_shape(self, shape: CursorShape) -> None:
-        self.shape = shape
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setOpacity(
-            clamp(self.shape.distance_opacity, 0.0, 1.0)
-        )
-        center_x = OVERLAY_SIZE / 2.0
-        center_y = OVERLAY_SIZE / 2.0
-
-        painter.save()
-        painter.translate(center_x, center_y)
-
-        # Qt rotation is clockwise in widget/screen coordinates.
-        painter.rotate(self.shape.angle_deg)
-
-        # Scale uniformly, then stretch along the SVG's forward axis.
-        painter.scale(
-            self.shape.scale,
-            self.shape.scale * self.shape.stretch,
-        )
-
-        # Render at the SVG's logical bounds. The painter transform scales and
-        # rotates the vector image at draw time.
-        self.svg_renderer.render(
-            painter,
-            QRectF(-10.0, -2.0, 20.0, 24.0),
-        )
-
-        painter.restore()
-        painter.end()
-
-
-class GreenDotOverlay(QWidget):
-    """Tiny always-on-top marker locked to the real pointer position."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.BypassWindowManagerHint
-            | Qt.WindowType.WindowTransparentForInput
-        )
-
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
-            True,
-        )
-
-        self.setFixedSize(GREEN_DOT_SIZE, GREEN_DOT_SIZE)
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 255, 0, 255))
-        painter.drawEllipse(2, 2, 5, 5)
-
-        painter.end()
-
-
-class BezierDebugOverlay(QWidget):
-    """
-    Optional full-screen debug overlay.
-
-    Draws:
-    - Green curves: active multi-segment Bezier route.
-    - Cyan dashed lines: control polygons.
-    - Red/cyan/blue/magenta points: P0/P1/P2/P3 for each segment.
-    - Yellow circle: current ship position.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.BypassWindowManagerHint
-            | Qt.WindowType.WindowTransparentForInput
-        )
-
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
-            True,
-        )
-
-        screen = QApplication.primaryScreen()
-        if screen is not None:
-            self.setGeometry(screen.geometry())
-
-        self.segments: list[BezierSegment] = []
-        self.current_position: tuple[float, float] | None = None
-
-    def set_route(
-        self,
-        segments: list[BezierSegment],
-        current_position: tuple[float, float],
-    ) -> None:
-        self.segments = segments
-        self.current_position = current_position
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        if not self.segments:
-            return
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        # Control polygons.
-        control_pen = QPen(QColor(0, 220, 255, 130))
-        control_pen.setWidthF(1.0)
-        control_pen.setStyle(Qt.PenStyle.DashLine)
-
-        painter.setPen(control_pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        for p0, p1, p2, p3 in self.segments:
-            painter.drawLine(QPointF(*p0), QPointF(*p1))
-            painter.drawLine(QPointF(*p1), QPointF(*p2))
-            painter.drawLine(QPointF(*p2), QPointF(*p3))
-
-        # Bezier curves.
-        curve_pen = QPen(QColor(0, 255, 130, 230))
-        curve_pen.setWidthF(2.0)
-
-        painter.setPen(curve_pen)
-
-        for p0, p1, p2, p3 in self.segments:
-            curve = QPainterPath()
-            curve.moveTo(QPointF(*p0))
-            curve.cubicTo(
-                QPointF(*p1),
-                QPointF(*p2),
-                QPointF(*p3),
-            )
-            painter.drawPath(curve)
-
-        # Control points.
-        colors = [
-            QColor(255, 100, 100, 255),
-            QColor(0, 220, 255, 255),
-            QColor(0, 180, 255, 255),
-            QColor(255, 80, 255, 255),
-        ]
-        labels = ["P0", "P1", "P2", "P3"]
-
-        for segment in self.segments:
-            for point, color, label in zip(
-                segment,
-                colors,
-                labels,
-            ):
-                self._draw_point(
-                    painter,
-                    QPointF(*point),
-                    color,
-                    label,
-                )
-
-        # Current position.
-        if self.current_position is not None:
-            current = QPointF(*self.current_position)
-
-            current_pen = QPen(QColor(255, 235, 0, 255))
-            current_pen.setWidthF(2.0)
-
-            painter.setPen(current_pen)
-            painter.setBrush(QColor(255, 235, 0, 110))
-            painter.drawEllipse(current, 6.0, 6.0)
-
-        painter.end()
-
-    def _draw_point(
-        self,
-        painter: QPainter,
-        point: QPointF,
-        color: QColor,
-        label: str,
-    ) -> None:
-        pen = QPen(color)
-        pen.setWidthF(1.5)
-
-        painter.setPen(pen)
-        painter.setBrush(
-            QColor(color.red(), color.green(), color.blue(), 120)
-        )
-        painter.drawEllipse(point, 4.0, 4.0)
-
-        painter.setPen(QColor(255, 255, 255, 220))
-        painter.drawText(
-            QPointF(point.x() + 7.0, point.y() - 7.0),
-            label,
-        )
-
-
-# ────────────────────────────── X11 controller ───────────────────────────────
-
-class VelocityCursorX11:
-    def __init__(self) -> None:
-        self.running = True
-        self.physics = CursorPhysics()
-
-        self.dpy = display.Display()
-        self.root = self.dpy.screen().root
-
-        xfixes_version = self.dpy.xfixes_query_version()
-        if xfixes_version.major_version < 2:
-            raise RuntimeError("XFIXES >= 2.0 is required to hide the cursor.")
-
-        self.root.xfixes_hide_cursor()
-
-        self.blank_cursor = self._create_transparent_xcursor()
-        self.root.change_attributes(cursor=self.blank_cursor)
-        self.dpy.sync()
-
-        self.qt_app = QApplication(sys.argv)
-
-        # Exactly one spaceship overlay.
-        self.overlay = CursorOverlay()
-        self.overlay.show()
-
-        # Exactly one green-dot overlay.
-        self.green_dot = GreenDotOverlay()
-        self.green_dot.show()
-
-        # Optional debug overlay.
-        self.bezier_debug: BezierDebugOverlay | None = None
-
-        if DEBUG_DRAW_BEZIER:
-            self.bezier_debug = BezierDebugOverlay()
-            self.bezier_debug.show()
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.tick)
-        self.timer.start(POLL_MS)
-
-    def _create_transparent_xcursor(self):
-        """Create an invisible X cursor from two one-bit pixmaps."""
-        source = self.root.create_pixmap(1, 1, 1)
-        mask = self.root.create_pixmap(1, 1, 1)
-
-        source_gc = source.create_gc(foreground=0, background=0)
-        mask_gc = mask.create_gc(foreground=0, background=0)
-
-        source.poly_fill_rectangle(source_gc, [(0, 0, 1, 1)])
-        mask.poly_fill_rectangle(mask_gc, [(0, 0, 1, 1)])
-
-        cursor = source.create_cursor(
-            mask,
-            (0, 0, 0),
-            (0, 0, 0),
-            0,
-            0,
-        )
-
-        source_gc.free()
-        mask_gc.free()
-        source.free()
-        mask.free()
-
-        return cursor
-
-    def pointer_position(self) -> tuple[int, int, int]:
-        """
-        Return the pointer location and button/modifier mask.
-
-        The mask contains X.Button1Mask when the left mouse button is down.
-        """
-        reply = self.root.query_pointer()
-        return reply.root_x, reply.root_y, reply.mask
-
-    def tick(self) -> None:
-        """Update physics, repaint the ship, and lock the dot to the pointer."""
-        if not self.running:
-            return
-
-        try:
-            pointer_x, pointer_y, button_mask = self.pointer_position()
-
-            mouse_down = bool(button_mask & X.Button1Mask)
-
-            shape = self.physics.update(
-                pointer_x,
-                pointer_y,
-                mouse_down=mouse_down,
-            )
-            
-            # Update the ship's visual state before moving its window.
-            self.overlay.set_shape(shape)
-
-            ship_x = round(self.physics.ship_x)
-            ship_y = round(self.physics.ship_y)
-
-            self.overlay.move(
-                ship_x - OVERLAY_SIZE // 2,
-                ship_y - OVERLAY_SIZE // 2,
-            )
-
-            # Immediate repaint reduces the chance of a stale X11 frame.
-            self.overlay.repaint()
-
-            # Keep the green dot exactly on the real pointer.
-            self.green_dot.move(
-                pointer_x - GREEN_DOT_SIZE // 2,
-                pointer_y - GREEN_DOT_SIZE // 2,
-            )
-
-            if self.bezier_debug is not None:
-                self.bezier_debug.set_route(
-                    self.physics.debug_segments(),
-                    self.physics.debug_position(),
-                )
-
-        except Exception as error:
-            print(f"Cursor update failed: {error}", file=sys.stderr)
-            self.stop()
-            self.qt_app.quit()
-
-    def stop(self, *_args) -> None:
-        """Restore the normal X cursor and release resources."""
-        if not self.running:
-            return
-
-        self.running = False
-
-        try:
-            self.timer.stop()
-        except Exception:
-            pass
-
-        try:
-            if self.bezier_debug is not None:
-                self.bezier_debug.close()
-        except Exception:
-            pass
-
-        try:
-            self.green_dot.close()
-        except Exception:
-            pass
-
-        try:
-            self.overlay.close()
-        except Exception:
-            pass
-
-        try:
-            self.root.change_attributes(cursor=X.NONE)
-            self.dpy.sync()
-        except Exception:
-            pass
-
-        try:
-            self.blank_cursor.free()
-        except Exception:
-            pass
-
-        try:
-            self.dpy.close()
-        except Exception:
-            pass
-
-
-# ───────────────────────────────── Entrypoint ────────────────────────────────
-
-def main() -> None:
-    if not os.environ.get("DISPLAY"):
-        raise SystemExit(
-            "No X11 DISPLAY detected. Run this from an X11/Xorg desktop session."
-        )
-
-    controller = VelocityCursorX11()
-
-    def exit_cleanly(*_args) -> None:
-        controller.stop()
-        controller.qt_app.quit()
-
-    signal.signal(signal.SIGINT, exit_cleanly)
-    signal.signal(signal.SIGTERM, exit_cleanly)
-
-    controller.qt_app.aboutToQuit.connect(controller.stop)
-    sys.exit(controller.qt_app.exec())
-
-
-if __name__ == "__main__":
-    main()

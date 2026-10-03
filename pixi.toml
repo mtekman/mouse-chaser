@@ -1,0 +1,14 @@
+[workspace]
+authors = ["Mehmet Tekman <mtekman89@gmail.com>"]
+channels = ["conda-forge"]
+name = "mouse-shaper"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+mouse = "python3 src/main.py"
+
+[dependencies]
+python-xlib = ">=0.33,<0.34"
+pillow = ">=12.3.0,<13"
+pyqt6 = ">=6.11.0,<7"
