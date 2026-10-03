@@ -63,17 +63,17 @@ LIN_SPEED_MIN = 500
 LIN_SPEED_DRAG = 1.2
 
 # Multi-segment Bezier route.
-DEBUG_DRAW_BEZIER = True
-BEZIER_SEGMENT_COUNT = 1                ## This is dynamically calcualted.
+DEBUG_DRAW_BEZIER = False
 BEZIER_REPLAN_DISTANCE = 100.0          ## How far to move before recalculating a curve
 BEZIER_WAYPOINT_CURVE_FRACTION = 0.1    ## 0 less curvy, high is more S-curvy. 1 is crazy. 0.1 feels good
 BEZIER_START_HANDLE_FRACTION = 10       ## High = more drift with broader turns. 10 gives nice looser feel
 BEZIER_START_HANDLE_MAX = 180.0         ## Stops fast movement from creating massive cruve. 180 is a good value.
 BEZIER_END_HANDLE_FRACTION = 0.8        ## How strong current momentum carries into new route. Higher = more drift
 BEZIER_END_HANDLE_MAX = 300             ## Max runway to ease into target. Low = tighter, high = broader, graceful
-BEZIER_MIN_SPEED = 10 * LIN_SPEED_MAX     ## Min speed to maintain along route
-BEZIER_ACCELERATION = 100            ## Rate at which to meet LIN_SPEED_MAX
-BEZIER_LENGTH_SAMPLES = 10               ## Number of samples to estimate Bezier
+BEZIER_MIN_SPEED = LIN_SPEED_MAX        ## Min speed to maintain along route
+BEZIER_ACCELERATION = 100               ## Rate at which to meet LIN_SPEED_MAX
+BEZIER_LENGTH_SAMPLES = 10              ## Number of samples to estimate Bezier
+## BEZIER_SEGMENT_COUNT = 1             ## This is dynamically calcualted.
 
 # Dead zone around the green dot.
 PHYS_DEAD_ZONE = 100  ## Do nothing until dot moves away
@@ -84,6 +84,11 @@ POLL_MS = 8
 STATIONARY_TICKS_REQUIRED = 10
 STATIONARY_RADIUS = 10
 STATIONARY_RESET_RADIUS = 20
+
+# Fade the spaceship out as its distance from the green dot increases.
+SPACESHIP_FADE_START_DISTANCE = 1.0   # Fully opaque at or below this.
+SPACESHIP_FADE_END_DISTANCE = 80.0     # Fully transparent at or above this.
+SPACESHIP_MIN_OPACITY = 0             # Set to 0.15 to keep a faint ship.
 
 # Overlay sizing.
 OVERLAY_SIZE = int(VIZ_SIZE_BASE * VIZ_SCALE_MAX * max(VIZ_ELONG_MAX, 1.0) * 6)
@@ -124,7 +129,7 @@ class CursorShape:
     stretch: float = 1.0
     speed: float = 0.0
     acceleration: float = 0.0
-
+    distance_opacity: float = 1.0
 
 # ─────────────────────────── Bezier flight physics ───────────────────────────
 
@@ -169,6 +174,46 @@ class CursorPhysics:
         self.last_stationary_y: float | None = None
         self.stationary_recalculated = False
 
+    def _distance_opacity(
+        self,
+        pointer_x: float,
+        pointer_y: float,
+    ) -> float:
+        """
+        Return an opacity value that increases with distance from the target.
+
+        The spaceship is most transparent at or below
+        SPACESHIP_FADE_START_DISTANCE, then becomes fully opaque at or beyond
+        SPACESHIP_FADE_END_DISTANCE.
+        """
+        distance = math.hypot(
+            pointer_x - self.ship_x,
+            pointer_y - self.ship_y,
+        )
+
+        if distance <= SPACESHIP_FADE_START_DISTANCE:
+            return SPACESHIP_MIN_OPACITY
+
+        if distance >= SPACESHIP_FADE_END_DISTANCE:
+            return 1.0
+
+        fade_range = (
+            SPACESHIP_FADE_END_DISTANCE
+            - SPACESHIP_FADE_START_DISTANCE
+        )
+
+        fade_progress = (
+            distance - SPACESHIP_FADE_START_DISTANCE
+        ) / fade_range
+
+        # Interpolate from the minimum opacity at close range to full
+        # opacity at long range.
+        return lerp(
+            SPACESHIP_MIN_OPACITY,
+            1.0,
+            fade_progress,
+        )
+    
     def _update_stationary_detection(
         self,
         pointer_x: float,
@@ -249,6 +294,12 @@ class CursorPhysics:
         # Light drag retains a drifting, momentum-based feel.
         ship_speed = self._apply_drag_and_limit(ship_speed, dt)
 
+        # Fade based on current distance from the green dot.
+        self.shape.distance_opacity = self._distance_opacity(
+            pointer_x,
+            pointer_y,
+        )
+        
         # Update visual scale, stretch, heading, and metrics.
         self._update_visuals(ship_speed, dt)
 
@@ -786,7 +837,9 @@ class CursorOverlay(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
+        painter.setOpacity(
+            clamp(self.shape.distance_opacity, 0.0, 1.0)
+        )
         center_x = OVERLAY_SIZE / 2.0
         center_y = OVERLAY_SIZE / 2.0
 
