@@ -50,11 +50,10 @@ from Xlib.ext import xfixes
 # Visual response.
 VIZ_SIZE_BASE = 10
 VIZ_ANGLE_OFFSET = 0
-VIZ_SPEED_MULT = 1.0 / 800.0
-VIZ_ACCEL_MULT = 1.0 / 90000.0
-VIZ_SCALE_MAX = 2
-VIZ_ELONG_MAX = 0.3
-SCALE_ACCEL_MULT = 0.20
+VIZ_SPEED_MULT = 1e-3
+VIZ_ACCEL_MULT = 1e-4
+VIZ_SCALE_MAX = 1.5
+VIZ_ELONG_MAX = 1.5
 VIZ_SHAPE_SMOOTH = 0.4
 
 # Linear motion.
@@ -89,6 +88,10 @@ STATIONARY_RESET_RADIUS = 20
 SPACESHIP_FADE_START_DISTANCE = 1.0   # Fully opaque at or below this.
 SPACESHIP_FADE_END_DISTANCE = 80.0     # Fully transparent at or above this.
 SPACESHIP_MIN_OPACITY = 0             # Set to 0.15 to keep a faint ship.
+
+# While the left mouse button is held, recalculate the Bezier route
+# every this many update ticks.
+MOUSE_DOWN_RECALC_INTERVAL = 5 ## This helps it orbit
 
 # Overlay sizing.
 OVERLAY_SIZE = int(VIZ_SIZE_BASE * VIZ_SCALE_MAX * max(VIZ_ELONG_MAX, 1.0) * 6)
@@ -173,6 +176,8 @@ class CursorPhysics:
         self.last_stationary_x: float | None = None
         self.last_stationary_y: float | None = None
         self.stationary_recalculated = False
+        # Mouse-down route recalculation.
+        self.mouse_down_tick_count = 0
 
     def _distance_opacity(
         self,
@@ -261,8 +266,13 @@ class CursorPhysics:
         return False
         
     # ─────────────────────────── Public update ───────────────────────────
-
-    def update(self, pointer_x: int, pointer_y: int) -> CursorShape:
+    def update(
+        self,
+        pointer_x: int,
+        pointer_y: int,
+        *,
+        mouse_down: bool = False,
+    ) -> CursorShape:
         now = time.monotonic()
 
         if self.last_time is None:
@@ -274,7 +284,28 @@ class CursorPhysics:
 
         self.pointer_x = pointer_x
         self.pointer_y = pointer_y
+        # While the left mouse button is held, force a fresh route every
+        # MOUSE_DOWN_RECALC_INTERVAL ticks.
+        if mouse_down:
+            self.mouse_down_tick_count += 1
 
+            if (
+                self.mouse_down_tick_count
+                >= MOUSE_DOWN_RECALC_INTERVAL
+            ):
+                self._create_route(
+                    self.ship_x,
+                    self.ship_y,
+                    float(pointer_x),
+                    float(pointer_y),
+                )
+
+                # Reset after recalculating, so the next route is created
+                # two ticks later.
+                self.mouse_down_tick_count = 0
+        else:
+            self.mouse_down_tick_count = 0
+            
         # If the pointer has been roughly still for three ticks, force a
         # fresh route to its exact current location.
         if self._update_stationary_detection(pointer_x, pointer_y):
@@ -760,7 +791,7 @@ class CursorPhysics:
         accel_amount = clamp(acceleration * VIZ_ACCEL_MULT, 0.0, 1.0)
 
         target_scale = 1.0 + speed_amount * (VIZ_SCALE_MAX - 1.0)
-        target_scale += accel_amount * SCALE_ACCEL_MULT
+        target_scale += accel_amount * VIZ_ACCEL_MULT
         target_scale = clamp(target_scale, 1.0, VIZ_SCALE_MAX)
 
         target_stretch = 1.0 + speed_amount * (VIZ_ELONG_MAX - 1.0)
@@ -1104,10 +1135,14 @@ class VelocityCursorX11:
 
         return cursor
 
-    def pointer_position(self) -> tuple[int, int]:
-        """Return the actual pointer location in root-window coordinates."""
+    def pointer_position(self) -> tuple[int, int, int]:
+        """
+        Return the pointer location and button/modifier mask.
+
+        The mask contains X.Button1Mask when the left mouse button is down.
+        """
         reply = self.root.query_pointer()
-        return reply.root_x, reply.root_y
+        return reply.root_x, reply.root_y, reply.mask
 
     def tick(self) -> None:
         """Update physics, repaint the ship, and lock the dot to the pointer."""
@@ -1115,9 +1150,16 @@ class VelocityCursorX11:
             return
 
         try:
-            pointer_x, pointer_y = self.pointer_position()
-            shape = self.physics.update(pointer_x, pointer_y)
+            pointer_x, pointer_y, button_mask = self.pointer_position()
 
+            mouse_down = bool(button_mask & X.Button1Mask)
+
+            shape = self.physics.update(
+                pointer_x,
+                pointer_y,
+                mouse_down=mouse_down,
+            )
+            
             # Update the ship's visual state before moving its window.
             self.overlay.set_shape(shape)
 
