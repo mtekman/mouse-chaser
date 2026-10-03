@@ -42,7 +42,7 @@ mouse_down_recalc_interval = 5 # While the left mouse button is held, recalculat
 
 [overlay]
 size = "auto" # Special value: "auto" calculates this from visual size, maximum scale, and maximum elongation.
-green_dot_size = 12
+green_dot_size = 0  ## Set to 0 to keep cursor
 
 [spaceship]
 svg_path = "spaceship.svg"

@@ -22,25 +22,26 @@ class CursorX11:
         self.dpy = display.Display()
         self.root = self.dpy.screen().root
 
-        xfixes_version = self.dpy.xfixes_query_version()
-        if xfixes_version.major_version < 2:
-            raise RuntimeError("XFIXES >= 2.0 is required to hide the cursor.")
-
-        self.root.xfixes_hide_cursor()
-
-        self.blank_cursor = self._create_transparent_xcursor()
-        self.root.change_attributes(cursor=self.blank_cursor)
-        self.dpy.sync()
-
         self.qt_app = QApplication(argv)
+
+        if GREEN_DOT_SIZE > 0:
+            ## Hide cursor
+            xfixes_version = self.dpy.xfixes_query_version()
+            if xfixes_version.major_version < 2:
+                raise RuntimeError("XFIXES >= 2.0 is required to hide the cursor.")
+            self.root.xfixes_hide_cursor()
+            self.blank_cursor = self._create_transparent_xcursor()
+            self.root.change_attributes(cursor=self.blank_cursor)
+            self.dpy.sync()
+            # Exactly one green-dot overlay.
+            self.green_dot = GreenDotOverlay(GREEN_DOT_SIZE)
+            self.green_dot.show()
+        else:
+            self.green_dot = None
 
         # Exactly one spaceship overlay.
         self.overlay = CursorOverlay(self.overlay_size, SPACESHIP_SVG)
         self.overlay.show()
-
-        # Exactly one green-dot overlay.
-        self.green_dot = GreenDotOverlay(GREEN_DOT_SIZE)
-        self.green_dot.show()
 
         # Optional debug overlay.
         self.bezier_debug: BezierDebugOverlay | None = None
@@ -119,10 +120,11 @@ class CursorX11:
             self.overlay.repaint()
 
             # Keep the green dot exactly on the real pointer.
-            self.green_dot.move(
-                pointer_x - self.green_dot_size // 2,
-                pointer_y - self.green_dot_size // 2,
-            )
+            if self.green_dot:
+                self.green_dot.move(
+                    pointer_x - self.green_dot_size // 2,
+                    pointer_y - self.green_dot_size // 2,
+                )
 
             if self.bezier_debug is not None:
                 self.bezier_debug.set_route(
@@ -153,10 +155,11 @@ class CursorX11:
         except Exception:
             pass
 
-        try:
-            self.green_dot.close()
-        except Exception:
-            pass
+        if self.green_dot:
+            try:
+                self.green_dot.close()
+            except Exception:
+                pass
 
         try:
             self.overlay.close()
