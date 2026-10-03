@@ -1,0 +1,48 @@
+# spaceship-cursor configuration
+visual:
+  size_base : 10
+  angle_offset : 0.0
+  speed_mult : 1e-3
+  accel_mult : 1e-4
+  scale_max : 1.5
+  elong_max : 1.5
+  shape_smooth : 0.4
+
+linear_motion:
+  speed_max : 700.0
+  speed_min : 500.0
+  speed_drag : 1.2
+
+bezier:
+  debug_draw_bezier : false  # How far the green dot must move before recalculating a curve.
+  replan_distance : 100.0
+  waypoint_curve_fraction : 0.1 # 0 : less curvy; higher : more S-curvy. 0.1 feels good.
+  start_handle_fraction : 10.0  # High : more drift and broader turns. 10 gives a looser feel.
+  start_handle_max : 180.0 # Stops fast movement from creating a massive curve.
+  end_handle_fraction : 0.8 # How strongly current momentum carries into a new route. Higher : more drift.
+  end_handle_max : 300.0 # Maximum runway used to ease into the target. Low : tighter; high : broader and more graceful.
+  min_speed : "lin_speed_max" # Special value: "lin_speed_max" uses linear_motion.speed_max.
+  acceleration : 100.0 # Rate at which to meet linear_motion.speed_max.
+  length_samples : 10 # Number of samples used to estimate each Bezier segment's length.
+
+physics:
+  dead_zone : 100.0 # Do nothing until the green dot moves farther away than this.
+  stationary_ticks_required : 10
+  stationary_radius : 10.0
+  stationary_reset_radius : 20.0
+
+spaceship_fade:
+  fade_start_distance : 1.0 # Fully transparent at or below this distance from the green dot.
+  fade_end_distance : 80.0  # Fully opaque at or above this distance from the green dot.
+  min_opacity : 0.0 # Minimum opacity when very close to the target. Use 0.15 to retain a faint spaceship near the dot.
+
+input:
+  poll_ms : 8 # Update interval, in milliseconds.
+  mouse_down_recalc_interval : 5 # While the left mouse button is held, recalculate the Bezier route every this many update ticks. This helps produce an orbiting effect.
+
+overlay:
+  size : "auto" # Special value: "auto" calculates this from visual size, maximum scale, and maximum elongation.
+  green_dot_size : 0  ## Set to 0 to keep cursor
+
+spaceship:
+  svg_path : "spaceship.svg"

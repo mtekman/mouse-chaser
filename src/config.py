@@ -1,10 +1,10 @@
 from pathlib import Path
-from tomllib import load
+from yaml import safe_load
 
 def load_config(path: Path) -> tuple[dict, bytes]:
     """Load TOML settings and the configured SVG file."""
     with path.open("rb") as config_file:
-        config = load(config_file)
+        config = safe_load(config_file)
 
     visual = config["visual"]
     linear = config["linear_motion"]
