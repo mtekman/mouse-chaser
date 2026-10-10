@@ -10,14 +10,15 @@ application:
     radius_beg : 10.0
     radius_end : 20.0
   bezier:
-    length_samples : 10 # Number of samples used to estimate each Bezier segment's length
+    length_samples : 2 # Number of samples used to estimate each Bezier segment's length
     debug_draw : false  # How far the green dot must move before recalculating a curve.
+  default_craft: spaceship
 
 craft:
   spaceship:
     svg:
       chaser: "spaceship"
-      cursor: 10 ## 0 to keep cursor, integer for a green cursor, and "crosshair.svg" to replace
+      cursor: 0 ## 0 to keep cursor, integer for a green cursor, and "crosshair.svg" to replace
     physics_profile: profile1
     fade:
       distance_beg : 1.0   # Fully transparent at or below this distance from the green dot.

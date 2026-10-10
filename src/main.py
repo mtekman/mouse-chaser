@@ -57,6 +57,5 @@ def main() -> None:
     controller.qt_app.aboutToQuit.connect(controller.stop)
     exit(controller.qt_app.exec())
 
-
 if __name__ == "__main__":
     main()
