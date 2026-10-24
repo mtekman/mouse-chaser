@@ -376,8 +376,8 @@ class BezierPhysics:
         With higher values, alternating perpendicular offsets create gentle
         S-shaped routes.
         """
-        BEZIER_SEGMENT_COUNT = round(4 * clamp(distance / screen_dist, 0, 1))
-        print(f"BEZIER_SEGMENT_COUNT={BEZIER_SEGMENT_COUNT}, {distance:.0f}/{screen_dist:.0f}", end="\r")
+        BEZIER_SEGMENT_COUNT = round(3.5 * clamp(math.sqrt(distance / screen_dist), 0, 1))
+        print(f"BEZIER_SEGMENT_COUNT={BEZIER_SEGMENT_COUNT}, {distance:.0f}/{screen_dist:.0f}                    ", end="\r")
         count = max(1, BEZIER_SEGMENT_COUNT)
         waypoints: list[tuple[float, float]] = []
 

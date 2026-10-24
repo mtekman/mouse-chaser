@@ -15,7 +15,8 @@ from green_dot import GreenDotOverlay
 
 
 class CursorX11(QObject):
-    activation_changed = pyqtSignal(bool)
+    # Emitted from the XRecord thread; connected slots run on Qt's main thread.
+    key_pressed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -24,7 +25,8 @@ class CursorX11(QObject):
         GREEN_DOT_SIZE,
         DEBUG_DRAW_BEZIER,
         POLL_MS,
-        ACTIVATION_KEY="Control_L",
+        CONTROL_KEYS=("Control_L", "Control_R"),
+        SHIFT_KEYS=("Shift_L", "Shift_R"),
     ) -> None:
         super().__init__()
 
@@ -34,9 +36,14 @@ class CursorX11(QObject):
         self.overlay_size = OVERLAY_SIZE
         self.green_dot_size = GREEN_DOT_SIZE
 
-        self.activation_key = ACTIVATION_KEY
-        self.activation_keycode = None
-        self.activation_key_down = False
+        self.control_keys = tuple(CONTROL_KEYS)
+        self.shift_keys = tuple(SHIFT_KEYS)
+
+        # keycode -> keysym name
+        self.monitored_keycodes: dict[int, str] = {}
+
+        self.overlay_visible = False
+        self.debug_visible = False
 
         self.dpy = display.Display()
         self.root = self.dpy.screen().root
@@ -45,7 +52,7 @@ class CursorX11(QObject):
 
         self._configure_key_listener()
 
-        self.activation_changed.connect(self._set_activation_state)
+        self.key_pressed.connect(self._handle_key_pressed)
 
         if GREEN_DOT_SIZE > 0:
             xfixes_version = self.dpy.xfixes_query_version()
@@ -68,9 +75,9 @@ class CursorX11(QObject):
 
         self.bezier_debug: BezierDebugOverlay | None = None
 
-        if DEBUG_DRAW_BEZIER:
-            self.bezier_debug = BezierDebugOverlay()
-            self.bezier_debug.hide()
+        # if DEBUG_DRAW_BEZIER: Toggled now by shift
+        self.bezier_debug = BezierDebugOverlay()
+        self.bezier_debug.hide()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
@@ -78,27 +85,32 @@ class CursorX11(QObject):
 
     def _configure_key_listener(self) -> None:
         """
-        Passively monitor one X11 keysym using XRecord.
+        Passively monitor Control and Shift keys with XRecord.
 
-        This does not grab or block the key: the desktop continues to receive
-        its normal KeyPress and KeyRelease events.
+        No grab is created, so the desktop continues to receive all original
+        keyboard events unchanged.
         """
-        keysym = XK.string_to_keysym(self.activation_key)
+        monitored_keys = self.control_keys + self.shift_keys
 
-        if keysym == 0:
-            raise ValueError(
-                f"Unknown X11 keysym: {self.activation_key!r}"
-            )
+        if not monitored_keys:
+            raise ValueError("At least one Control or Shift key is required.")
 
-        self.activation_keycode = self.dpy.keysym_to_keycode(keysym)
+        for key_name in monitored_keys:
+            keysym = XK.string_to_keysym(key_name)
 
-        if self.activation_keycode == 0:
-            raise ValueError(
-                f"Could not map keysym to a keycode: {self.activation_key!r}"
-            )
+            if keysym == 0:
+                raise ValueError(f"Unknown X11 keysym: {key_name!r}")
 
-        # Use a separate X connection for RECORD. This keeps recording
-        # isolated from the connection used for normal application events.
+            keycode = self.dpy.keysym_to_keycode(keysym)
+
+            if keycode == 0:
+                raise ValueError(
+                    f"Could not map keysym to a keycode: {key_name!r}"
+                )
+
+            self.monitored_keycodes[keycode] = key_name
+
+        # A separate connection keeps XRecord isolated from normal events.
         self.record_dpy = display.Display()
 
         self.record_context = self.record_dpy.record_create_context(
@@ -126,7 +138,7 @@ class CursorX11(QObject):
 
     def _record_loop(self) -> None:
         """
-        Enable the RECORD context. This call blocks while recording.
+        Enable XRecord. This blocks while recording, so run it in a thread.
         """
         try:
             self.record_dpy.record_enable_context(
@@ -138,10 +150,8 @@ class CursorX11(QObject):
 
     def _record_callback(self, reply) -> None:
         """
-        Called by XRecord with raw protocol data.
-
-        Parse each event, then emit a Qt signal so that all Qt operations
-        happen on the main GUI thread.
+        Parse XRecord protocol data and emit only KeyPress events for
+        configured keys.
         """
         if reply.category != record.FromServer:
             return
@@ -162,35 +172,47 @@ class CursorX11(QObject):
                 None,
             )
 
-            if event.type not in (X.KeyPress, X.KeyRelease):
+            if event.type != X.KeyPress:
                 continue
 
-            if event.detail != self.activation_keycode:
+            key_name = self.monitored_keycodes.get(event.detail)
+
+            if key_name is None:
                 continue
 
-            if event.type == X.KeyPress:
-                self.activation_changed.emit(True)
-            else:
-                self.activation_changed.emit(False)
+            self.key_pressed.emit(key_name)
 
-    def _set_activation_state(self, down: bool) -> None:
+    def _handle_key_pressed(self, key_name: str) -> None:
         """
-        Update application state and overlays on the Qt main thread.
+        Handle a key press on Qt's main thread.
+
+        Control toggles the spaceship overlay.
+        Shift toggles the Bezier debug overlay.
         """
         if not self.running:
             return
 
-        self.activation_key_down = down
+        if key_name in self.control_keys:
+            self.overlay_visible = not self.overlay_visible
 
-        if down:
-            self.overlay.show()
+            if self.overlay_visible:
+                self.overlay.show()
+            else:
+                self.overlay.hide()
 
-            if self.bezier_debug is not None:
+        if key_name in self.shift_keys:
+            print("HERE")
+            if self.bezier_debug is None:
+                print("HERE2")
+                return
+
+            self.debug_visible = not self.debug_visible
+
+            print("HERE3")
+            if self.debug_visible:
+                print("HERE4")
                 self.bezier_debug.show()
-        else:
-            self.overlay.hide()
-
-            if self.bezier_debug is not None:
+            else:
                 self.bezier_debug.hide()
 
     def _create_transparent_xcursor(self):
@@ -230,13 +252,13 @@ class CursorX11(QObject):
 
     def tick(self) -> None:
         """
-        Update physics and render overlays only while the activation key
-        is held down.
+        Update physics and render the spaceship only while the overlay is
+        visible.
         """
         if not self.running:
             return
 
-        if not self.activation_key_down:
+        if not self.overlay_visible:
             return
 
         try:
@@ -268,7 +290,7 @@ class CursorX11(QObject):
                     pointer_y - self.green_dot_size // 2,
                 )
 
-            if self.bezier_debug is not None:
+            if self.bezier_debug is not None and self.debug_visible:
                 self.bezier_debug.set_route(
                     self.physics.debug_segments(),
                     self.physics.debug_position(),
