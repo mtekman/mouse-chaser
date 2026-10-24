@@ -31,10 +31,18 @@ class CursorOverlay(QWidget):
         self.shape = SpacecraftState()
 
         self.svg_renderer = QSvgRenderer()
-        self.svg_renderer.load(SPACESHIP_SVG)
+        self.set_svg(SPACESHIP_SVG)
 
+    def set_svg(self, svg: bytes) -> None:
+        self.svg_renderer.load(svg)
         if not self.svg_renderer.isValid():
-            raise RuntimeError("The embedded spaceship SVG could not be parsed.")
+            raise RuntimeError("The configured craft SVG could not be parsed.")
+
+        self.update()
+
+    def set_overlay_size(self, overlay_size: int) -> None:
+        self.overlay_size = overlay_size
+        self.setFixedSize(overlay_size, overlay_size)
 
     def set_shape(self, shape: SpacecraftState) -> None:
         self.shape = shape

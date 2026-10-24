@@ -24,8 +24,48 @@ craft:
       distance_beg : 1.0   # Fully transparent at or below this distance from the green dot.
       distance_end : 80.0  # Fully opaque at or above this distance from the green dot.
       opacity_min : 0.0   # Minimum opacity when very close to the target. Use 0.15 to retain a faint spaceship near the dot.
+    subscribed_events: [RunSwitch]
+  ufo:
+    svg:
+      chaser: "ufo"
+      cursor: 0
+    physics_profile: profile1
+    fade:
+      distance_beg : 1.0
+      distance_end : 80.0
+      opacity_min : 0.0
     
-    
+# For each key, entries run in config order: down, periodic hold, then up.
+# key accepts an X11 keysym (for example "space") or a mouse button ("Button1").
+# craft selects a craft entry; cursor is 0, a numeric marker size, or an SVG name.
+event_profile:
+  - name: RunSwitch
+    key: Button1
+    events:
+      - type: down
+        craft: ufo
+        cursor: 0
+        physics_profile: profile1
+        physics_restore: true
+      - type: hold
+        every: 100
+        craft: ufo
+        cursor: 0
+        physics_profile: profile1
+        physics_restore: true
+      - type: hold
+        every: 100
+        every_offset: 50
+        craft: spaceship
+        cursor: 0
+        physics_profile: profile1
+        physics_restore: true
+      - type: up
+        craft: spaceship
+        cursor: 0
+        physics_profile: profile1
+        physics_restore: true
+
 physics_profile:
   profile1:
     visual:

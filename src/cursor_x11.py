@@ -10,34 +10,41 @@ from Xlib.protocol import rq
 
 from bezier_physics import BezierPhysics
 from bezier_debug import BezierDebugOverlay
+from config import load_svg, select_profile
 from cursor_overlay import CursorOverlay
+from event_profiles import EventProfiles
 from green_dot import GreenDotOverlay
+from svg_cursor_overlay import SvgCursorOverlay
 
 
 class CursorX11(QObject):
     # Emitted from the XRecord thread; connected slots run on Qt's main thread.
-    key_pressed = pyqtSignal(str)
+    input_event = pyqtSignal(str, str)
 
     def __init__(
         self,
-        SPACESHIP_SVG,
-        OVERLAY_SIZE,
-        GREEN_DOT_SIZE,
-        DEBUG_DRAW_BEZIER,
-        POLL_MS,
+        config: dict,
+        spaceship_svg: bytes,
         CONTROL_KEYS=("Control_L", "Control_R"),
         SHIFT_KEYS=("Shift_L", "Shift_R"),
     ) -> None:
         super().__init__()
 
         self.running = True
-        self.physics = BezierPhysics()
+        self.config = config
+        self.physics = BezierPhysics(config)
 
-        self.overlay_size = OVERLAY_SIZE
-        self.green_dot_size = GREEN_DOT_SIZE
+        self.overlay_size = config["OVERLAY_SIZE"]
+        self.cursor_size = 0
 
         self.control_keys = tuple(CONTROL_KEYS)
         self.shift_keys = tuple(SHIFT_KEYS)
+        self.event_profiles = EventProfiles(
+            config["EVENT_PROFILES"],
+            self._apply_event_profile,
+            self._active_craft_subscribes,
+        )
+        self.restore_physics_profiles: dict[str, str] = {}
 
         # keycode -> keysym name
         self.monitored_keycodes: dict[int, str] = {}
@@ -52,25 +59,13 @@ class CursorX11(QObject):
 
         self._configure_key_listener()
 
-        self.key_pressed.connect(self._handle_key_pressed)
+        self.input_event.connect(self._handle_input_event)
 
-        if GREEN_DOT_SIZE > 0:
-            xfixes_version = self.dpy.xfixes_query_version()
+        self.cursor_overlay = None
+        self.blank_cursor = None
+        self._set_cursor(config["CURSOR"])
 
-            if xfixes_version.major_version < 2:
-                raise RuntimeError("XFIXES >= 2.0 is required to hide the cursor.")
-
-            self.root.xfixes_hide_cursor()
-            self.blank_cursor = self._create_transparent_xcursor()
-            self.root.change_attributes(cursor=self.blank_cursor)
-            self.dpy.sync()
-
-            self.green_dot = GreenDotOverlay(GREEN_DOT_SIZE)
-            self.green_dot.show()
-        else:
-            self.green_dot = None
-
-        self.overlay = CursorOverlay(self.overlay_size, SPACESHIP_SVG)
+        self.overlay = CursorOverlay(self.overlay_size, spaceship_svg)
         self.overlay.hide()
 
         self.bezier_debug: BezierDebugOverlay | None = None
@@ -81,21 +76,29 @@ class CursorX11(QObject):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
-        self.timer.start(POLL_MS)
+        self.timer.start(config["POLL_MS"])
 
     def _configure_key_listener(self) -> None:
         """
-        Passively monitor Control and Shift keys with XRecord.
+        Passively monitor configured keys and mouse buttons with XRecord.
 
         No grab is created, so the desktop continues to receive all original
         keyboard events unchanged.
         """
-        monitored_keys = self.control_keys + self.shift_keys
+        monitored_keys = (
+            self.control_keys
+            + self.shift_keys
+            + tuple(
+                profile["key"]
+                for profile in self.config["EVENT_PROFILES"]
+                if not profile["key"].startswith("Button")
+            )
+        )
 
         if not monitored_keys:
-            raise ValueError("At least one Control or Shift key is required.")
+            raise ValueError("At least one keyboard key is required.")
 
-        for key_name in monitored_keys:
+        for key_name in set(monitored_keys):
             keysym = XK.string_to_keysym(key_name)
 
             if keysym == 0:
@@ -122,7 +125,7 @@ class CursorX11(QObject):
                 "ext_requests": (0, 0, 0, 0),
                 "ext_replies": (0, 0, 0, 0),
                 "delivered_events": (0, 0),
-                "device_events": (X.KeyPress, X.KeyRelease),
+                "device_events": (X.KeyPress, X.ButtonRelease),
                 "errors": (0, 0),
                 "client_started": False,
                 "client_died": False,
@@ -150,8 +153,8 @@ class CursorX11(QObject):
 
     def _record_callback(self, reply) -> None:
         """
-        Parse XRecord protocol data and emit only KeyPress events for
-        configured keys.
+        Parse XRecord protocol data and emit configured keyboard and mouse
+        input transitions.
         """
         if reply.category != record.FromServer:
             return
@@ -172,27 +175,43 @@ class CursorX11(QObject):
                 None,
             )
 
-            if event.type != X.KeyPress:
+            if event.type in (X.KeyPress, X.KeyRelease):
+                key_name = self.monitored_keycodes.get(event.detail)
+                if key_name is None:
+                    continue
+                phase = "down" if event.type == X.KeyPress else "up"
+            elif event.type in (X.ButtonPress, X.ButtonRelease):
+                key_name = f"Button{event.detail}"
+                phase = "down" if event.type == X.ButtonPress else "up"
+            else:
                 continue
 
-            key_name = self.monitored_keycodes.get(event.detail)
+            self.input_event.emit(key_name, phase)
 
-            if key_name is None:
-                continue
-
-            self.key_pressed.emit(key_name)
-
-    def _handle_key_pressed(self, key_name: str) -> None:
+    def _handle_input_event(self, key_name: str, phase: str) -> None:
         """
-        Handle a key press on Qt's main thread.
-
-        Control toggles the spaceship overlay.
-        Shift toggles the Bezier debug overlay.
+        Handle an input transition on Qt's main thread.
         """
         if not self.running:
             return
 
-        if key_name in self.control_keys:
+        if phase == "down":
+            if self._should_restore_physics(key_name):
+                self.restore_physics_profiles[key_name] = self.config[
+                    "ACTIVE_PHYSICS_PROFILE"
+                ]
+            if not self.event_profiles.down(key_name):
+                self.restore_physics_profiles.pop(key_name, None)
+        else:
+            self.event_profiles.up(key_name)
+            restore_profile = self.restore_physics_profiles.pop(key_name, None)
+            if restore_profile is not None:
+                self._select_profile(
+                    self.config["ACTIVE_CRAFT"],
+                    restore_profile,
+                )
+
+        if phase == "down" and key_name in self.control_keys:
             self.overlay_visible = not self.overlay_visible
 
             if self.overlay_visible:
@@ -200,20 +219,88 @@ class CursorX11(QObject):
             else:
                 self.overlay.hide()
 
-        if key_name in self.shift_keys:
-            print("HERE")
+        if phase == "down" and key_name in self.shift_keys:
             if self.bezier_debug is None:
-                print("HERE2")
                 return
 
             self.debug_visible = not self.debug_visible
 
-            print("HERE3")
             if self.debug_visible:
-                print("HERE4")
                 self.bezier_debug.show()
             else:
                 self.bezier_debug.hide()
+
+    def _should_restore_physics(self, key_name: str) -> bool:
+        return any(
+            profile["key"] == key_name
+            and profile["type"] == "down"
+            and profile["physics_restore"]
+            and self._active_craft_subscribes(profile)
+            for profile in self.config["EVENT_PROFILES"]
+        )
+
+    def _active_craft_subscribes(self, profile: dict) -> bool:
+        craft = self.config["CRAFTS"][self.config["ACTIVE_CRAFT"]]
+        return profile["name"] in craft.get("subscribed_events", [])
+
+    def _apply_event_profile(self, profile: dict) -> None:
+        self._select_profile(
+            profile["craft"],
+            profile["physics_profile"],
+        )
+        self._set_cursor(profile["cursor"])
+
+    def _select_profile(
+        self,
+        craft_name: str,
+        physics_profile_name: str,
+    ) -> None:
+        craft_svg = select_profile(
+            self.config,
+            craft_name=craft_name,
+            physics_profile_name=physics_profile_name,
+        )
+        self.overlay_size = self.config["OVERLAY_SIZE"]
+        self.physics.set_config(self.config)
+        self.overlay.set_overlay_size(self.overlay_size)
+        self.overlay.set_svg(craft_svg)
+
+    def _set_cursor(self, cursor: int | str) -> None:
+        if self.cursor_overlay is not None:
+            self.cursor_overlay.close()
+            self.cursor_overlay = None
+
+        if cursor == 0:
+            self.cursor_size = 0
+            if self.blank_cursor is not None:
+                self.root.xfixes_show_cursor()
+            self.root.change_attributes(cursor=X.NONE)
+            self.dpy.sync()
+            return
+
+        if self.blank_cursor is None:
+            xfixes_version = self.dpy.xfixes_query_version()
+            if xfixes_version.major_version < 2:
+                raise RuntimeError("XFIXES >= 2.0 is required to hide the cursor.")
+
+            self.root.xfixes_hide_cursor()
+            self.blank_cursor = self._create_transparent_xcursor()
+            self.root.change_attributes(cursor=self.blank_cursor)
+            self.dpy.sync()
+
+        if isinstance(cursor, int):
+            self.cursor_overlay = GreenDotOverlay(cursor)
+        elif isinstance(cursor, str):
+            cursor_name = cursor.removesuffix(".svg")
+            self.cursor_overlay = SvgCursorOverlay(load_svg(cursor_name))
+        else:
+            raise ValueError(f"Unsupported cursor value {cursor!r}.")
+
+        self.cursor_size = max(
+            self.cursor_overlay.width(),
+            self.cursor_overlay.height(),
+        )
+        self.cursor_overlay.show()
 
     def _create_transparent_xcursor(self):
         """Create an invisible X cursor from two one-bit pixmaps."""
@@ -258,6 +345,8 @@ class CursorX11(QObject):
         if not self.running:
             return
 
+        self.event_profiles.tick()
+
         if not self.overlay_visible:
             return
 
@@ -284,10 +373,10 @@ class CursorX11(QObject):
 
             self.overlay.repaint()
 
-            if self.green_dot:
-                self.green_dot.move(
-                    pointer_x - self.green_dot_size // 2,
-                    pointer_y - self.green_dot_size // 2,
+            if self.cursor_overlay:
+                self.cursor_overlay.move(
+                    pointer_x - self.cursor_overlay.width() // 2,
+                    pointer_y - self.cursor_overlay.height() // 2,
                 )
 
             if self.bezier_debug is not None and self.debug_visible:
@@ -339,9 +428,9 @@ class CursorX11(QObject):
         except Exception:
             pass
 
-        if self.green_dot:
+        if self.cursor_overlay:
             try:
-                self.green_dot.close()
+                self.cursor_overlay.close()
             except Exception:
                 pass
 
@@ -356,10 +445,11 @@ class CursorX11(QObject):
         except Exception:
             pass
 
-        try:
-            self.blank_cursor.free()
-        except Exception:
-            pass
+        if self.blank_cursor is not None:
+            try:
+                self.blank_cursor.free()
+            except Exception:
+                pass
 
         try:
             self.dpy.close()

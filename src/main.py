@@ -45,9 +45,7 @@ def main() -> None:
         raise SystemExit(
             "No X11 DISPLAY detected. Run this from an X11/Xorg desktop session."
         )
-    controller = CursorX11(SPACESHIP_SVG,
-                           CONFIG["OVERLAY_SIZE"], CONFIG["GREEN_DOT_SIZE"],
-                           CONFIG["DEBUG_DRAW_BEZIER"], CONFIG["POLL_MS"])
+    controller = CursorX11(CONFIG, SPACESHIP_SVG)
 
     def exit_cleanly(*_args) -> None:
         controller.stop(); controller.qt_app.quit()

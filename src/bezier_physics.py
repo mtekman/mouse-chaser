@@ -26,7 +26,10 @@ class BezierPhysics:
     This preserves momentum while producing gentle curved intercepts.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None) -> None:
+        if config is not None:
+            self.set_config(config)
+
         self.pointer_x: int | None = None
         self.pointer_y: int | None = None
         self.last_time: float | None = None
@@ -59,6 +62,11 @@ class BezierPhysics:
         self.stationary_recalculated = False
         # Mouse-down route recalculation.
         self.mouse_down_tick_count = 0
+
+    def set_config(self, config: dict) -> None:
+        """Use the shared runtime configuration for subsequent updates."""
+        global CONFIG
+        CONFIG = config
 
     def _distance_opacity(
         self,
@@ -708,4 +716,3 @@ class BezierPhysics:
     def debug_position(self) -> tuple[float, float]:
         """Return the ship's current position."""
         return self.ship_x, self.ship_y
-
