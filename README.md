@@ -6,6 +6,15 @@ markers, and input-triggered craft changes are configured in `config.yaml`.
 
 ![Mouse Shaper Bezier overlay](screenshots/bezier.webp)
 
+## Quick controls
+
+- Press either **Control** key to show or hide the craft overlay.
+- Press either **Shift** key to show or hide the Bezier debug overlay.
+- Hold the left mouse button to trigger the default `RunSwitch` craft event.
+
+These bindings are configurable in `application.craft_toggle_keys`,
+`application.debug_toggle_keys`, and `event_profile` in `config.yaml`.
+
 ## Requirements
 
 - Linux desktop running an X11/Xorg session (Wayland is not supported)
@@ -19,9 +28,9 @@ From the repository root:
 pixi run mouse
 ```
 
-The application loads `config.yaml` and the SVG assets from `svgs/`. Press
-either Control key to show or hide the craft overlay. Press either Shift key
-to show or hide the Bezier debug overlay.
+The application loads `config.yaml` and the SVG assets from `svgs/`. The
+default bindings use either Control key to show or hide the craft overlay and
+either Shift key to show or hide the Bezier debug overlay.
 
 ## Configuration
 
@@ -33,6 +42,11 @@ to show or hide the Bezier debug overlay.
 - `physics_profile`: reusable visual and movement profiles.
 
 `application.default_craft` chooses the craft used at startup.
+
+`application.craft_toggle_keys` and `application.debug_toggle_keys` are
+non-empty lists of X11 keysyms for toggling the craft and Bezier debug
+overlays. The defaults are `Control_L`/`Control_R` and `Shift_L`/`Shift_R`;
+for example, use `[F1]` to bind the craft toggle to F1.
 
 ### Crafts
 

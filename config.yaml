@@ -13,6 +13,8 @@ application:
     length_samples : 2 # Number of samples used to estimate each Bezier segment's length
     debug_draw : false  # How far the green dot must move before recalculating a curve.
   default_craft: spaceship
+  craft_toggle_keys: [Control_L, Control_R]
+  debug_toggle_keys: [Shift_L, Shift_R]
 
 craft:
   spaceship:

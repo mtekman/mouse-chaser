@@ -25,8 +25,6 @@ class CursorX11(QObject):
         self,
         config: dict,
         spaceship_svg: bytes,
-        CONTROL_KEYS=("Control_L", "Control_R"),
-        SHIFT_KEYS=("Shift_L", "Shift_R"),
     ) -> None:
         super().__init__()
 
@@ -37,8 +35,8 @@ class CursorX11(QObject):
         self.overlay_size = config["OVERLAY_SIZE"]
         self.cursor_size = 0
 
-        self.control_keys = tuple(CONTROL_KEYS)
-        self.shift_keys = tuple(SHIFT_KEYS)
+        self.control_keys = config["CRAFT_TOGGLE_KEYS"]
+        self.shift_keys = config["DEBUG_TOGGLE_KEYS"]
         self.event_profiles = EventProfiles(
             config["EVENT_PROFILES"],
             self._apply_event_profile,

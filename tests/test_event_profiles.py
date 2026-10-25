@@ -33,6 +33,15 @@ class EventProfilesTest(unittest.TestCase):
     def test_selects_configured_craft_and_profile(self) -> None:
         config, _ = load_config(Path("config.yaml"))
 
+        self.assertEqual(
+            config["CRAFT_TOGGLE_KEYS"],
+            ("Control_L", "Control_R"),
+        )
+        self.assertEqual(
+            config["DEBUG_TOGGLE_KEYS"],
+            ("Shift_L", "Shift_R"),
+        )
+
         svg = select_profile(
             config,
             craft_name="ufo",

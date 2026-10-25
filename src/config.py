@@ -13,6 +13,17 @@ def _overlay_size(profile: dict) -> int:
     )
 
 
+def _key_names(application: dict, setting: str) -> tuple[str, ...]:
+    keys = application.get(setting)
+    if not isinstance(keys, list) or not keys or not all(
+        isinstance(key, str) and key for key in keys
+    ):
+        raise ValueError(
+            f"application.{setting} must be a non-empty list of X11 keysyms."
+        )
+    return tuple(keys)
+
+
 def _validate_event_profiles(config: dict) -> list[dict]:
     profile_groups = config.get("event_profile", [])
     if not isinstance(profile_groups, list):
@@ -189,6 +200,8 @@ def load_config(path: Path) -> tuple[dict, bytes]:
     if default_profile not in physics_profiles:
         raise ValueError(f"Unknown physics profile {default_profile!r}.")
 
+    craft_toggle_keys = _key_names(application, "craft_toggle_keys")
+    debug_toggle_keys = _key_names(application, "debug_toggle_keys")
     conf = {
         "BEZIER_LENGTH_SAMPLES": int(application["bezier"]["length_samples"]),
         "PHYS_DEAD_ZONE": float(application["dead_zone"]),
@@ -205,6 +218,8 @@ def load_config(path: Path) -> tuple[dict, bytes]:
         "MOUSE_DOWN_RECALC_INTERVAL": int(
             application["mouse_down_recalc_interval"]
         ),
+        "CRAFT_TOGGLE_KEYS": craft_toggle_keys,
+        "DEBUG_TOGGLE_KEYS": debug_toggle_keys,
         "CRAFTS": crafts,
         "PHYSICS_PROFILES": physics_profiles,
         "EVENT_PROFILES": events,
